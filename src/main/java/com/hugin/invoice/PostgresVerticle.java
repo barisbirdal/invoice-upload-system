@@ -5,7 +5,8 @@ import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
-import io.vertx.mssqlclient.MSSQLConnectOptions;
+import io.vertx.pgclient.PgBuilder;
+import io.vertx.pgclient.PgConnectOptions;
 import io.vertx.sqlclient.Pool;
 import io.vertx.sqlclient.PoolOptions;
 import io.vertx.sqlclient.Row;
@@ -17,7 +18,8 @@ import java.util.List;
 
 import static com.hugin.invoice.EventBusAddresses.*;
 
-public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository {
+// PostgreSQL Verticle: InvoiceRepository interface'ini implemente eder ve sadece 4 tekil EventBus komutunu dinler
+public class PostgresVerticle extends AbstractVerticle implements InvoiceRepository {
 
     private Pool client;
 
@@ -25,31 +27,33 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
     public void start(Promise<Void> startPromise) {
         JsonObject dbConfig = config().getJsonObject("db", new JsonObject());
 
-        MSSQLConnectOptions connectOptions = new MSSQLConnectOptions()
+        PgConnectOptions connectOptions = new PgConnectOptions()
                 .setHost(dbConfig.getString("host", "localhost"))
-                .setPort(dbConfig.getInteger("port", 1433))
+                .setPort(dbConfig.getInteger("port", 5433))
                 .setDatabase(dbConfig.getString("database", "upload_system"))
-                .setUser(dbConfig.getString("user", "vertx"))
+                .setUser(dbConfig.getString("user", "postgres"))
                 .setPassword(dbConfig.getString("password", "1234"));
 
-        int poolSize = dbConfig.getInteger("poolSize", 5);
-        client = Pool.pool(vertx, connectOptions, new PoolOptions().setMaxSize(poolSize));
+        PoolOptions poolOptions = new PoolOptions().setMaxSize(dbConfig.getInteger("poolSize", 5));
+        client = PgBuilder.pool()
+                .with(poolOptions)
+                .connectingTo(connectOptions)
+                .using(vertx)
+                .build();
 
         String migrationPath = dbConfig.getString("migrationPath", "migration/init.sql");
 
-        runMigration(migrationPath)
+        vertx.fileSystem().readFile(migrationPath)
+                .compose(buffer -> client.query(buffer.toString()).execute())
                 .onSuccess(v -> {
-                    System.out.println("MsSqlVerticle: Migration (" + migrationPath + ") başarıyla çalıştırıldı!");
+                    System.out.println("PostgresVerticle: Migration (" + migrationPath + ") başarıyla çalıştırıldı!");
                     registerConsumers();
                     startPromise.complete();
                 })
-                .onFailure(startPromise::fail);
-    }
-
-    private Future<Void> runMigration(String sqlFilePath) {
-        return vertx.fileSystem().readFile(sqlFilePath)
-                .compose(buffer -> client.query(buffer.toString()).execute())
-                .mapEmpty();
+                .onFailure(err -> {
+                    System.err.println("PostgresVerticle Migration hatası: " + err.getMessage());
+                    startPromise.fail(err);
+                });
     }
 
     private void registerConsumers() {
@@ -119,7 +123,7 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
         return BigDecimal.valueOf(val != null ? val : 0.0);
     }
 
-    // --- SQL SORGULARI ---
+    // --- POSTGRESQL SORGULARI ($1, $2 ve RETURNING id) ---
     private Future<JsonArray> getCustomers() {
         return client.query("SELECT id, name, tckn FROM customer ORDER BY id DESC").execute().map(rows -> {
             JsonArray list = new JsonArray();
@@ -133,7 +137,7 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
     private Future<JsonObject> insertCustomer(JsonObject body) {
         String name = body.getString("name");
         String tckn = body.getString("tckn");
-        return client.preparedQuery("INSERT INTO customer (name, tckn) OUTPUT INSERTED.id VALUES (@p1, @p2)")
+        return client.preparedQuery("INSERT INTO customer (name, tckn) VALUES ($1, $2) RETURNING id")
                 .execute(Tuple.of(name, tckn))
                 .map(rows -> new JsonObject().put("id", rows.iterator().next().getInteger("id")).put("name", name).put("tckn", tckn));
     }
@@ -141,7 +145,7 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
     private Future<JsonObject> updateCustomer(int id, JsonObject body) {
         String name = body.getString("name");
         String tckn = body.getString("tckn");
-        return client.preparedQuery("UPDATE customer SET name = @p1, tckn = @p2 WHERE id = @p3")
+        return client.preparedQuery("UPDATE customer SET name = $1, tckn = $2 WHERE id = $3")
                 .execute(Tuple.of(name, tckn, id))
                 .compose(res -> res.rowCount() == 0
                         ? Future.failedFuture("Güncellenecek müşteri bulunamadı.")
@@ -149,7 +153,7 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
     }
 
     private Future<JsonObject> deleteCustomer(int id) {
-        return client.preparedQuery("DELETE FROM customer WHERE id = @p1").execute(Tuple.of(id))
+        return client.preparedQuery("DELETE FROM customer WHERE id = $1").execute(Tuple.of(id))
                 .compose(res -> res.rowCount() == 0
                         ? Future.failedFuture("Silinecek müşteri bulunamadı.")
                         : Future.succeededFuture(new JsonObject().put("deleted", true).put("id", id)));
@@ -159,7 +163,7 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
         return client.query("SELECT id, name, price FROM items ORDER BY id DESC").execute().map(rows -> {
             JsonArray list = new JsonArray();
             for (Row row : rows) {
-                list.add(new JsonObject().put("id", row.getInteger("id")).put("name", row.getString("name")).put("price", row.getBigDecimal("price").doubleValue()));
+                list.add(new JsonObject().put("id", row.getInteger("id")).put("name", row.getString("name")).put("price", row.getNumeric("price").doubleValue()));
             }
             return list;
         });
@@ -168,7 +172,7 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
     private Future<JsonObject> insertItem(JsonObject body) {
         String name = body.getString("name");
         Double price = body.getDouble("price");
-        return client.preparedQuery("INSERT INTO items (name, price) OUTPUT INSERTED.id VALUES (@p1, @p2)")
+        return client.preparedQuery("INSERT INTO items (name, price) VALUES ($1, $2) RETURNING id")
                 .execute(Tuple.of(name, toDecimal(price)))
                 .map(rows -> new JsonObject().put("id", rows.iterator().next().getInteger("id")).put("name", name).put("price", price));
     }
@@ -176,7 +180,7 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
     private Future<JsonObject> updateItem(int id, JsonObject body) {
         String name = body.getString("name");
         Double price = body.getDouble("price");
-        return client.preparedQuery("UPDATE items SET name = @p1, price = @p2 WHERE id = @p3")
+        return client.preparedQuery("UPDATE items SET name = $1, price = $2 WHERE id = $3")
                 .execute(Tuple.of(name, toDecimal(price), id))
                 .compose(res -> res.rowCount() == 0
                         ? Future.failedFuture("Güncellenecek ürün bulunamadı.")
@@ -184,7 +188,7 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
     }
 
     private Future<JsonObject> deleteItem(int id) {
-        return client.preparedQuery("DELETE FROM items WHERE id = @p1").execute(Tuple.of(id))
+        return client.preparedQuery("DELETE FROM items WHERE id = $1").execute(Tuple.of(id))
                 .compose(res -> res.rowCount() == 0
                         ? Future.failedFuture("Silinecek ürün bulunamadı.")
                         : Future.succeededFuture(new JsonObject().put("deleted", true).put("id", id)));
@@ -213,7 +217,7 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
                        c.id AS customer_id, c.name AS customer_name, c.tckn AS customer_tckn
                 FROM invoices i
                 JOIN customer c ON i.customer_id = c.id
-                WHERE i.id = @p1
+                WHERE i.id = $1
                 """;
         return client.preparedQuery(invoiceSql).execute(Tuple.of(id)).compose(rows -> {
             if (!rows.iterator().hasNext()) {
@@ -224,9 +228,9 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
                     .put("id", row.getInteger("id"))
                     .put("serial", row.getString("serial"))
                     .put("no", row.getString("no"))
-                    .put("totalAmount", row.getBigDecimal("total_amount").doubleValue())
-                    .put("discountAmount", row.getBigDecimal("discount_amount").doubleValue())
-                    .put("payableAmount", row.getBigDecimal("payable_amount").doubleValue())
+                    .put("totalAmount", row.getNumeric("total_amount").doubleValue())
+                    .put("discountAmount", row.getNumeric("discount_amount").doubleValue())
+                    .put("payableAmount", row.getNumeric("payable_amount").doubleValue())
                     .put("customer", new JsonObject()
                             .put("id", row.getInteger("customer_id"))
                             .put("name", row.getString("customer_name"))
@@ -234,9 +238,9 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
 
             String itemsSql = """
                     SELECT ii.quantity, ii.total, it.id AS item_id, it.name, it.price
-                    FROM invoiceItems ii
+                    FROM invoice_items ii
                     JOIN items it ON ii.item_id = it.id
-                    WHERE ii.invoice_id = @p1
+                    WHERE ii.invoice_id = $1
                     """;
             return client.preparedQuery(itemsSql).execute(Tuple.of(id)).map(itemRows -> {
                 JsonArray itemList = new JsonArray();
@@ -244,9 +248,9 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
                     itemList.add(new JsonObject()
                             .put("itemId", ir.getInteger("item_id"))
                             .put("name", ir.getString("name"))
-                            .put("unitPrice", ir.getBigDecimal("price").doubleValue())
+                            .put("unitPrice", ir.getNumeric("price").doubleValue())
                             .put("quantity", ir.getInteger("quantity"))
-                            .put("total", ir.getBigDecimal("total").doubleValue()));
+                            .put("total", ir.getNumeric("total").doubleValue()));
                 }
                 return invoice.put("items", itemList);
             });
@@ -259,7 +263,7 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
                        c.name AS customer_name, c.tckn AS customer_tckn
                 FROM invoices i
                 JOIN customer c ON i.customer_id = c.id
-                WHERE i.serial = @p1 AND i.no = @p2
+                WHERE i.serial = $1 AND i.no = $2
                 """;
         return client.preparedQuery(sql).execute(Tuple.of(serial, no)).compose(rows -> {
             if (!rows.iterator().hasNext()) {
@@ -281,14 +285,14 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
         return client.withTransaction(conn -> {
             String insertInvoiceSql = """
                     INSERT INTO invoices (serial, no, customer_id, total_amount, discount_amount, payable_amount)
-                    OUTPUT INSERTED.id
-                    VALUES (@p1, @p2, @p3, @p4, @p5, @p6)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    RETURNING id
                     """;
             return conn.preparedQuery(insertInvoiceSql)
                     .execute(Tuple.of(serial, no, customerId, toDecimal(totalAmount), toDecimal(discountAmount), toDecimal(payableAmount)))
                     .compose(rows -> {
                         int invoiceId = rows.iterator().next().getInteger("id");
-                        String insertItemSql = "INSERT INTO invoiceItems (invoice_id, item_id, quantity, total) VALUES (@p1, @p2, @p3, @p4)";
+                        String insertItemSql = "INSERT INTO invoice_items (invoice_id, item_id, quantity, total) VALUES ($1, $2, $3, $4)";
                         List<Tuple> batch = new ArrayList<>();
                         for (int i = 0; i < items.size(); i++) {
                             JsonObject item = items.getJsonObject(i);
@@ -316,17 +320,17 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
         return client.withTransaction(conn -> {
             String updateSql = """
                     UPDATE invoices
-                    SET serial = @p1, no = @p2, customer_id = @p3,
-                        total_amount = @p4, discount_amount = @p5, payable_amount = @p6
-                    WHERE id = @p7
+                    SET serial = $1, no = $2, customer_id = $3,
+                        total_amount = $4, discount_amount = $5, payable_amount = $6
+                    WHERE id = $7
                     """;
             return conn.preparedQuery(updateSql)
                     .execute(Tuple.of(serial, no, customerId, toDecimal(totalAmount), toDecimal(discountAmount), toDecimal(payableAmount), id))
                     .compose(res -> res.rowCount() == 0
                             ? Future.failedFuture("Güncellenecek fatura bulunamadı.")
-                            : conn.preparedQuery("DELETE FROM invoiceItems WHERE invoice_id = @p1").execute(Tuple.of(id)))
+                            : conn.preparedQuery("DELETE FROM invoice_items WHERE invoice_id = $1").execute(Tuple.of(id)))
                     .compose(res -> {
-                        String insertItemSql = "INSERT INTO invoiceItems (invoice_id, item_id, quantity, total) VALUES (@p1, @p2, @p3, @p4)";
+                        String insertItemSql = "INSERT INTO invoice_items (invoice_id, item_id, quantity, total) VALUES ($1, $2, $3, $4)";
                         List<Tuple> batch = new ArrayList<>();
                         for (int i = 0; i < items.size(); i++) {
                             JsonObject item = items.getJsonObject(i);
@@ -344,8 +348,8 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
 
     private Future<JsonObject> deleteInvoice(int id) {
         return client.withTransaction(conn ->
-                conn.preparedQuery("DELETE FROM invoiceItems WHERE invoice_id = @p1").execute(Tuple.of(id))
-                        .compose(res -> conn.preparedQuery("DELETE FROM invoices WHERE id = @p1").execute(Tuple.of(id)))
+                conn.preparedQuery("DELETE FROM invoice_items WHERE invoice_id = $1").execute(Tuple.of(id))
+                        .compose(res -> conn.preparedQuery("DELETE FROM invoices WHERE id = $1").execute(Tuple.of(id)))
                         .compose(res -> res.rowCount() == 0
                                 ? Future.failedFuture("Silinecek fatura bulunamadı.")
                                 : Future.succeededFuture(new JsonObject().put("deleted", true).put("id", id)))
@@ -357,9 +361,9 @@ public class MsSqlVerticle extends AbstractVerticle implements InvoiceRepository
                 .put("id", row.getInteger("id"))
                 .put("serial", row.getString("serial"))
                 .put("no", row.getString("no"))
-                .put("totalAmount", row.getBigDecimal("total_amount").doubleValue())
-                .put("discountAmount", row.getBigDecimal("discount_amount").doubleValue())
-                .put("payableAmount", row.getBigDecimal("payable_amount").doubleValue())
+                .put("totalAmount", row.getNumeric("total_amount").doubleValue())
+                .put("discountAmount", row.getNumeric("discount_amount").doubleValue())
+                .put("payableAmount", row.getNumeric("payable_amount").doubleValue())
                 .put("customerName", row.getString("customer_name"))
                 .put("customerTckn", row.getString("customer_tckn"));
     }

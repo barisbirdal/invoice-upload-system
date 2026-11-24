@@ -13,7 +13,7 @@ public class Main {
                     JsonObject config = buffer.toJsonObject();
                     DeploymentOptions options = new DeploymentOptions().setConfig(config);
 
-                    return vertx.deployVerticle(new MsSqlVerticle(), options)
+                    return vertx.deployVerticle(new PostgresVerticle(), options)
                             .compose(id -> vertx.deployVerticle(new HttpServerVerticle(), options));
                 })
                 .onSuccess(id -> System.out.println("Tüm sistem config.json ayarlarıyla başarıyla başlatıldı!"))
