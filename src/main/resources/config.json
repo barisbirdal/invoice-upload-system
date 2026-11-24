@@ -1,0 +1,14 @@
+{
+  "http": {
+    "port": 8080
+  },
+  "db": {
+    "host": "localhost",
+    "port": 1433,
+    "database": "upload_system",
+    "user": "vertx",
+    "password": "1234",
+    "poolSize": 5,
+    "migrationPath": "migration/init.sql"
+  }
+}
